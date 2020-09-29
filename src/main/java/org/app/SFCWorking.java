@@ -3,6 +3,9 @@ package org.app;
 
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+
+import org.app.util.IPTest.IpRouteFeatures;
+import org.app.util.IPTest.RouteKey;
 import org.onlab.packet.*;
 import org.onlab.util.KryoNamespace;
 import org.onosproject.core.ApplicationId;
@@ -34,10 +37,12 @@ public class SFCWorking implements PacketProcessor {
     private MeterService meterService;
     private MeterStore meterStore;
     private ARPHandler arpHandler;
+    private MeterId meterIdForSFC;
     private PacketService packetService;
     private ArrayList<String> ipArrayList;
     private Map<DeviceId, Map<MacAddress, PortNumber>> macTables = Maps.newConcurrentMap();
     Map<MacAddress, PortNumber> macTable;
+    Map<MacAddress, PortNumber> macTableForSFC= Maps.newConcurrentMap();
     private ArrayList<MacAddress> macAddressList;
     private Map<IpAddress, MacAddress> sfcList = Maps.newConcurrentMap();
     // private ArrayList<MacAddress> prescribedRouteList;
@@ -47,7 +52,9 @@ public class SFCWorking implements PacketProcessor {
             .register(Integer.class)
             .register(DeviceId.class)
             .build("group-fwd-app");
-
+    private boolean routeTF=false;
+    private Device deviceForSFC;
+    private long rateFromSFC=1000;
     public SFCWorking(FlowRuleService flowRuleService, ApplicationId appId, HostService hostService,
                       DeviceService deviceService, TopologyService topologyService,
                       GroupService groupService, MeterService meterService, MeterStore meterStore, PacketService packetService) {
@@ -66,13 +73,7 @@ public class SFCWorking implements PacketProcessor {
         ipArrayList = new ArrayList<String>();
         macAddressList = new ArrayList<MacAddress>();
         // prescribedRouteList=new ArrayList<MacAddress>();
-        ipArrayList.add("10.0.0.1");
-        ipArrayList.add("10.0.0.2");
-        ipArrayList.add("10.0.0.3");
-        Device device = deviceIterator.next();
-        for (String ipValue : ipArrayList) {
-            arpHandler.buildArpRequest(packetService, device.id(), IpAddress.valueOf(ipValue));
-        }
+        deviceForSFC = deviceIterator.next();
     }
 
     private HostListener hostListener = event -> {
@@ -86,9 +87,9 @@ public class SFCWorking implements PacketProcessor {
             Map<MacAddress, PortNumber> macTable = macTables.get(DeviceId.deviceId(deviceId));
             macAddressList.add(macAddress);
             sfcList.put(ipv4Address, macAddress);
-            log.info("sfcList_body:" + sfcList);
+            // log.info("sfcList_body:" + sfcList);
             macTable.put(macAddress, port);
-            
+            macTableForSFC.put(macAddress, port);
             //    dnsIpAddressHostInfoMap.put(ipv4Address.toString(), macAddress);
             //            log.info("ipAddressHostInfoMap:" + ipAddressHostInfoMap + "\n" +
             //                    "info: " + info + "\n" +
@@ -103,13 +104,13 @@ public class SFCWorking implements PacketProcessor {
     public void process(PacketContext packetContext) {
         log.info("------------------------------------------------------");
         initMacTable(packetContext.inPacket().receivedFrom());
-        // registerMeter(packetContext);
+        registerMeter(packetContext);
         actLikeSwitchforSFC(packetContext);
         runSFC(packetContext);
-        // processSFC(packetContext);
     }
     private void registerMeter(PacketContext packetContext) {
         DeviceId deviceId = packetContext.inPacket().receivedFrom().deviceId();
+        // log.info("-------------------registerMeter_deviceId"+deviceId);
         long maxMeters = meterStore.getMaxMeters(MeterFeaturesKey.key(deviceId));
         if (0L == maxMeters) {
             meterStore.storeMeterFeatures(DefaultMeterFeatures.builder()
@@ -124,34 +125,67 @@ public class SFCWorking implements PacketProcessor {
 
         short type = ethernet.getEtherType();
 
+        // if(type == Ethernet.TYPE_IPV4){
+        //     log.info("desssssssssssss:"+ethernet.getSourceMAC());
+        // }
         if (type != Ethernet.TYPE_IPV4 && type != Ethernet.TYPE_ARP) {
             return;
         }
         ConnectPoint connectPoint = packetContext.inPacket().receivedFrom();
+        // log.info("outMac:" + connectPoint.toString());
         Map<MacAddress, PortNumber> macTable = macTables.get(connectPoint.deviceId());
+        // log.info("macTable:" + macTable);
         MacAddress srcMac = ethernet.getSourceMAC();
-
         MacAddress dstMac = ethernet.getDestinationMAC();
         macTable.put(srcMac, connectPoint.port());
         PortNumber outPort = macTable.get(dstMac);
-
+        // log.info("srcMac:" + srcMac);
+        // log.info("outMac:" + dstMac);
+        // log.info("srcPort:" + macTable.get(srcMac));
+        // log.info("outPort:" + macTable.get(dstMac));
         if (outPort != null) {
             if (type == Ethernet.TYPE_IPV4) {
                 IPv4 iPv4 = (IPv4) ethernet.getPayload();
-
+                IpAddress srcIpv4Address = IpAddress.valueOf(((IPv4) ethernet.getPayload()).getSourceAddress());
+                IpAddress desIpv4Address = IpAddress.valueOf(((IPv4) ethernet.getPayload()).getDestinationAddress());
+                for (Map.Entry<RouteKey,IpRouteFeatures> entry : AppComponent.getIpRouteInfo().entrySet()) {
+                    log.info("=============================================="+(entry.getKey().equals(RouteKey.key(srcIpv4Address.toString()+desIpv4Address.toString()))));
+                    if(entry.getKey().equals(RouteKey.key(srcIpv4Address.toString()+desIpv4Address.toString()))){
+                        // log.info("yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy");
+                        routeTF=true;
+                        ipArrayList=entry.getValue().getIpRoute();
+                        rateFromSFC=entry.getValue().getRate();
+                        for (String ipValue : ipArrayList) {
+                            arpHandler.buildArpRequest(packetService, deviceForSFC.id(), IpAddress.valueOf(ipValue));   
+                        }
+                    }
+                }
+                log.info("--------------------rateFromSFC:"+rateFromSFC);
+                if(meterIdForSFC==null){
+                    log.info("*********************meterIdForSFC:null");
+                }else{
+                    log.info("*********************meterIdForSFC:have");
+                }
+                MeterId meterId = checkMeter(srcIpv4Address,connectPoint.deviceId());
+                meterIdForSFC=meterId;
+                log.info("meterId:------------------------"+meterId);
                 TrafficSelector trafficSelector = DefaultTrafficSelector.builder()
                         .matchEthSrc(srcMac)
                         .matchEthDst(dstMac)
                         .build();
                 createFlowRule(trafficSelector,
-                        createTrafficTreatment(null, outPort),
+                        createTrafficTreatment(meterId, outPort),
                         connectPoint.deviceId());
-
+                // log.info("oooooooooooooooooo");
+                // packetContext.treatmentBuilder().setOutput(outPort);
+                // packetContext.send();
             } else {
+                // log.info("pppppppppppppppppppppppppppp");
                 packetContext.treatmentBuilder().setOutput(outPort);
                 packetContext.send();
             }
         } else {
+            // log.info("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
             actLikeHub(packetContext);
         }
     }
@@ -165,19 +199,72 @@ public class SFCWorking implements PacketProcessor {
                 .withPriority(10)
                 .makeTemporary(Temporary)
                 .build();
+        // log.info("========================");
 
         flowRuleService.applyFlowRules(flowRule);
     }
     private void runSFC(PacketContext packetContext) {
+        // log.info("processSFC-------------------"+packetContext.inPacket().parsed().getEtherType());
         if (packetContext.inPacket().parsed().getEtherType() != Ethernet.TYPE_IPV4) return;
+        Ethernet ethernet = packetContext.inPacket().parsed();
+        int sfcCount = 0;
+        //來源IP 寫死的話就是一開始的ip陣列 向是這個程式式10.0.0.1
+        // for (IpAddress ipAddress : srcSfFeatures.ipAddress()) {
+        //     log.info("ipAddress:"+ipAddress);
+        //     if (IpAddress.valueOf(iPv4.getSourceAddress()).equals(ipAddress)) {
+        //         log.info("sfcount:"+srcSfCount);
+        //         srcSfFeatures.macAddress().put(ipAddress, ethernet.getSourceMAC());
+        //         hasSrcChain = true;
+        //         break;
+        //     }
+        // }
+        //目的IP 寫死的話就是一開始的ip陣列 向是這個程式式10.0.0.3
+        // for (IpAddress ipAddress : dstSfFeatures.ipAddress()) {
+        //     if (IpAddress.valueOf(iPv4.getDestinationAddress()).equals(ipAddress)) {
+        //         dstSfFeatures.macAddress().put(ipAddress, ethernet.getDestinationMAC());
+        //         hasDstChain = true;
+        //         break;
+        //     }
+        // }
+        // if (!hasSrcChain || !hasDstChain) {
+        //     break;
+        // }
+        //判斷路線是否存在 這個程式只有一條 10.0.0.1 ->10.0.0.3
+        // ArrayList<SFFeatures> usefulSfInfo = new ArrayList<>();
+        // boolean isExistSfInfo = true;
+        // for (String domain : entry.getValue().rsp()) {
+        //     SFFeatures sfFeatures = AppComponent.getSfInfo().get(SFKey.key(domain));
+        //     if (null == sfFeatures) {
+        //         isExistSfInfo = false;
+        //         break;
+        //     } else {
+        //         for (Map.Entry<IpAddress, MacAddress> macAddressEntry : sfFeatures.macAddress().entrySet()) {
+        //             if (null == macAddressEntry.getValue()) {
+        //                 isExistSfInfo = false;
+        //                 break;
+        //             }
+        //         }
+        //     }
+        //     usefulSfInfo.add(sfFeatures);
+        // }
+        // if (!isExistSfInfo) {
+        //     usefulSfInfo.clear();
+        //     break;
+        // }
         
-        ArrayList<String> ipArrayListforReturnRoute = new ArrayList<>(ipArrayList);
-        Collections.reverse(ipArrayListforReturnRoute);
+        log.info("routeTF:------------------------"+routeTF);
 
-
-        addTag(flowRuleService, packetContext, ipArrayList, false);
-    
-
+        // log.info("ipArrayListforReturnRoute:------------------------"+ipArrayListforReturnRoute);
+        if(routeTF){
+            log.info("ipArrayList:------------------------"+ipArrayList);
+            ArrayList<String> ipArrayListforReturnRoute = new ArrayList<>(ipArrayList);
+            Collections.reverse(ipArrayListforReturnRoute);
+            addTag(flowRuleService, packetContext, ipArrayList, false);
+            log.info("tttttttttttttttttttttttt");
+        // ArrayList<SFFeatures> reverseSfInfo = new ArrayList<>(usefulSfInfo);
+            addTag(flowRuleService, packetContext,ipArrayListforReturnRoute,true);
+        }
+        // }
     }
 
     //改封包
@@ -190,50 +277,63 @@ public class SFCWorking implements PacketProcessor {
             for (int position = 0; position < ipArrayListforAddTag.size() - 1; position++) {
                 String currentIp = ipArrayListforAddTag.get(position);
                 String nextIp = ipArrayListforAddTag.get(position + 1);
+                log.info("addTag:------------------currentIp--------------:" + currentIp);
+                log.info("addTag:------------------------nextIp:"+nextIp);
+                if(meterIdForSFC==null){
+                    log.info("*********************meterIdForSFC:null");
+                }else{
+                    log.info("*********************meterIdForSFC:have");
+                }
                 MplsLabel mplsLabel;
                 MacAddress ethDst;
                 IpPrefix iPDst;
+                PortNumber outPort;
                 if (isReverse) {
                     mplsLabel = MplsLabel.mplsLabel(1048575 - sfId);
                     ethDst = ethernet.getSourceMAC();
-                    IpAddress dstIpAddress = IpAddress.valueOf(iPv4.getDestinationAddress());
+                    outPort=macTableForSFC.get(ethernet.getSourceMAC());
+                    IpAddress dstIpAddress = IpAddress.valueOf(iPv4.getSourceAddress());
                     iPDst = dstIpAddress.toIpPrefix();
                 } else {
                     mplsLabel = MplsLabel.mplsLabel(sfId);
                     ethDst = ethernet.getDestinationMAC();
+                    outPort=macTableForSFC.get(ethernet.getDestinationMAC());
                     IpAddress dstIpAddress = IpAddress.valueOf(iPv4.getDestinationAddress());
                     iPDst = dstIpAddress.toIpPrefix();
                 }
-                //currentIpAddress
-                IpAddress ipAddress = IpAddress.valueOf(currentIp);
+                log.info("*********************ethDst:"+ethDst.toString());
+                log.info("*********************macTableForSFC:"+macTableForSFC);
+                if(outPort != null){
+                    //currentIpAddress
+                    IpAddress ipAddress = IpAddress.valueOf(currentIp);
+                    // TrafficTreatment trafficTreatment = DefaultTrafficTreatment.builder()
+                    //         .meter(meterIdForSFC)
+                    //         .pushMpls()
+                    //         .setMpls(mplsLabel)
+                    //         .transition(1)
+                    //         .build();
+                    TrafficTreatment trafficTreatment =createTrafficTreatmentForSFC(mplsLabel,isReverse,position);
+                    FlowRule flowRule = DefaultFlowRule.builder()
+                            .withSelector(DefaultTrafficSelector.builder()
+                                    .matchEthType(Ethernet.TYPE_IPV4)
+                                    .matchEthDst(ethDst)
+                                    .matchEthSrc(sfcList.get(ipAddress))
+                                    .matchIPDst(iPDst)
+                                    .build())
+                            .withTreatment(trafficTreatment)
+                            .forDevice(packetContext.inPacket().receivedFrom().deviceId())
+                            .fromApp(AppComponent.appId)
+                            .makeTemporary(Temporary)
+                            .withPriority(50)
+                            .forTable(0)
+                            .build();
+                    log.info("-----addTagaddTagaddTag------" + flowRule.toString());
+                    flowRuleService.applyFlowRules(flowRule);
 
-                TrafficTreatment trafficTreatment = DefaultTrafficTreatment.builder()
-                        .pushMpls()
-                        .setMpls(mplsLabel)
-                        .transition(1)
-                        .build();
-
-
-                FlowRule flowRule = DefaultFlowRule.builder()
-                        .withSelector(DefaultTrafficSelector.builder()
-                                .matchEthType(Ethernet.TYPE_IPV4)
-                                .matchEthDst(ethDst)
-                                .matchEthSrc(sfcList.get(ipAddress))
-                                .matchIPDst(iPDst)
-                                .build())
-                        .withTreatment(trafficTreatment)
-                        .forDevice(packetContext.inPacket().receivedFrom().deviceId())
-                        .fromApp(AppComponent.appId)
-                        .makeTemporary(Temporary)
-                        .withPriority(50)
-                        .forTable(0)
-                        .build();
-                log.info("-----addTagaddTagaddTag------" + flowRule.toString());
-                flowRuleService.applyFlowRules(flowRule);
-
-                processSfcFlowRule(packetContext, IpAddress.valueOf(currentIp), IpAddress.valueOf(nextIp), mplsLabel, isReverse, sfId);
-                sfId++;
-
+                    processSfcFlowRule(packetContext, IpAddress.valueOf(currentIp), IpAddress.valueOf(nextIp), mplsLabel, isReverse, sfId);
+                    sfId++;
+                }
+                
             }
         }).start();
     }
@@ -245,6 +345,21 @@ public class SFCWorking implements PacketProcessor {
         return trafficTreatment.build();
     }
 
+    private TrafficTreatment createTrafficTreatmentForSFC(MplsLabel mplsLabel, Boolean isReverse,int position) {
+        TrafficTreatment.Builder trafficTreatment = DefaultTrafficTreatment.builder();
+
+        if(position>0){
+            trafficTreatment.pushMpls()
+            .setMpls(mplsLabel)
+            .transition(1);
+        }else{
+            trafficTreatment.meter(meterIdForSFC)
+            .pushMpls()
+            .setMpls(mplsLabel)
+            .transition(1);
+        }
+        return trafficTreatment.build();
+    }
     private void initMacTable(ConnectPoint connectPoint) {
         macTables.putIfAbsent(connectPoint.deviceId(), Maps.newConcurrentMap());
     }
@@ -384,9 +499,10 @@ public class SFCWorking implements PacketProcessor {
     private MeterId checkMeter(IpAddress ipv4Address,DeviceId deviceId) {
         for (String ipString:ipArrayList){
             if (ipString.equals(ipv4Address.toString())){
+                log.info("checkMeter_ipv4Address"+ipv4Address.toString());
+                log.info("==========================checkMeter_rateFromSFC:"+rateFromSFC);
                 IpAddress ip =IpAddress.valueOf(ipString);
-                MeterId meterId = processMeterTable(deviceId,1000L);
-                log.info("---------------checkMeter:"+meterId.toString());
+                MeterId  meterId = processMeterTable(deviceId,rateFromSFC);
                 return meterId;
             }
         }
@@ -400,9 +516,9 @@ public class SFCWorking implements PacketProcessor {
             bands.add(DefaultBand.builder()
                     .ofType(Band.Type.DROP)
                     .withRate(rate)
-                    .burstSize(0)
+                    .burstSize(10)
                     .build());
-            log.info("----------------processMeterTableBand:"+bands);
+            // log.info("----------------processMeterTableBand:"+bands);
             MeterRequest meterRequest = DefaultMeterRequest.builder()
                     .forDevice(deviceId)
                     .fromApp(appId)
@@ -417,7 +533,7 @@ public class SFCWorking implements PacketProcessor {
     private MeterId checkExistMeter(long rate) {
         boolean hasMeter = false;
         for (Meter meter : meterService.getAllMeters()) {
-            log.info("---------------checkExistMeter:"+meter);
+            // log.info("---------------checkExistMeter:"+meter);
             for (Band band : meter.bands()) {
                 if (rate == band.rate()) {
                     hasMeter = true;
